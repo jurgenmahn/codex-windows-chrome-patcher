@@ -46,24 +46,49 @@ pnpm install
 
 ## Quick Start
 
-From PowerShell:
+From PowerShell, just run the one-shot script:
+
+```powershell
+cd .\codex-windows-chrome-patcher
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+`run.ps1` does everything end to end:
+
+1. Checks Node.js is installed (>= 18).
+2. Installs dependencies (`pnpm install`, falling back to `npm install`).
+3. Finds the newest installed Codex package (via `Get-AppxPackage`, so it does
+   not need the special WindowsApps listing permission).
+4. Stops any running Codex, then copies it to a fixed location:
+   **`~/codex-patched`** (i.e. `C:\Users\<you>\codex-patched`).
+5. Patches `app.asar` and, if that build enforces it, the `Codex.exe` integrity hash.
+6. Creates/refreshes a **`Codex (Patched)`** shortcut on your Desktop.
+7. Launches the patched copy.
+
+Useful switches:
+
+- `-NoLaunch` &mdash; set everything up but do not start Codex.
+- `-NoShortcut` &mdash; skip the Desktop shortcut.
+
+### After a Codex update
+
+Just run `run.ps1` again. It rebuilds `~/codex-patched` from the newly installed
+Store version, re-patches it, and the Desktop shortcut keeps working because the
+location is fixed. That's the entire update flow.
+
+### Manual steps (if you prefer not to use run.ps1)
 
 ```powershell
 cd .\codex-windows-chrome-patcher
 pnpm install
 
-$source = (Get-ChildItem "C:\Program Files\WindowsApps" -Directory -Filter "OpenAI.Codex_*" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-$target = "C:\tmp\CodexChromePatched"
+$source = (Get-AppxPackage -Name "OpenAI.Codex*" | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation
+$target = Join-Path $HOME "codex-patched"
 
-Copy-Item -LiteralPath $source -Destination $target -Recurse
+if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+robocopy "$source" "$target" /E /COPY:DAT /NFL /NDL /NJH /NJS /NP | Out-Null
 node .\scripts\patch-codex-chrome-windows.mjs --app $target --apply --patch-exe-integrity
 powershell -ExecutionPolicy Bypass -File .\scripts\launch-patched-codex.ps1 -AppRoot $target
-```
-
-If your Codex version folder differs, adjust `$source`. You can find it with:
-
-```powershell
-Get-ChildItem "C:\Program Files\WindowsApps" -Directory -Filter "OpenAI.Codex_*"
 ```
 
 ## What Happens When Codex Updates
@@ -74,24 +99,23 @@ Microsoft Store updates install a new protected package under `C:\Program Files\
 OpenAI.Codex_<new-version>_x64__2p2nqsd0c76g0
 ```
 
-Your loose patched copy, such as `C:\tmp\CodexChromePatched`, is not automatically updated. After a Codex update, one of these will usually be true:
+Your loose patched copy at `~/codex-patched` is not automatically updated. After a Codex update, one of these will usually be true:
 
 - The Store version has the official feature enabled, and this patch is no longer needed.
-- The Store version still hides Chrome, and you need to create a fresh loose copy from the new Store package and patch it again.
+- The Store version still hides Chrome, and you need to rebuild the loose copy from the new Store package and patch it again.
 - The app bundle changed enough that the script cannot find its markers, and the script must be updated.
 
 Recommended update flow:
 
-1. Close Codex and Chrome.
-2. Find the newest `OpenAI.Codex_*` folder under `WindowsApps`.
-3. Copy that folder to a new loose path, for example `C:\tmp\CodexChromePatched-<version>`.
-4. Run the patcher in `--dry-run` mode first.
-5. If all markers are found, run with `--apply --patch-exe-integrity`.
-6. Launch the new patched copy.
-7. Open Chrome and confirm the extension says `Connected`.
-8. Verify Codex can see the Chrome backend before deleting the previous patched copy.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
 
-Keep one older working patched copy until the new one is verified.
+That rebuilds `~/codex-patched` from the newest installed Store package, re-patches
+it, refreshes the Desktop shortcut, and launches it. If the bundle markers ever
+move, the patcher fails loudly with a `Patch markers missing` message instead of
+producing a broken copy; in that case the script needs updating (see
+Troubleshooting).
 
 ## Verify
 
@@ -129,16 +153,16 @@ Codex settings screen as expected — the patch does not change that navigation.
 
 ## Restore / Rollback
 
-For a loose copy, rollback is simple:
+For a loose copy, rollback is simple &mdash; delete it (the Store install is untouched):
 
 ```powershell
-Remove-Item -LiteralPath "C:\tmp\CodexChromePatched" -Recurse -Force
+Remove-Item -LiteralPath "$HOME\codex-patched" -Recurse -Force
 ```
 
-If you used the patch script on another copy and want to restore its `app.asar` from backup:
+If you want to restore just the `app.asar` of a patched copy from its backup:
 
 ```powershell
-node .\scripts\patch-codex-chrome-windows.mjs --app "C:\tmp\CodexChromePatched" --restore "C:\tmp\CodexChromePatched\app\resources\app.asar.bak-..."
+node .\scripts\patch-codex-chrome-windows.mjs --app "$HOME\codex-patched" --restore "$HOME\codex-patched\app\resources\app.asar.bak-..."
 ```
 
 ## How It Works
@@ -224,5 +248,6 @@ Expected result:
 
 ## Files
 
+- `run.ps1`: one-shot setup &mdash; checks Node, installs deps, copies the newest Store Codex to `~/codex-patched`, patches it, refreshes the Desktop shortcut, and launches. Re-run after any Codex update.
 - `scripts/patch-codex-chrome-windows.mjs`: patches a Codex app copy.
 - `scripts/launch-patched-codex.ps1`: closes Store Codex processes and launches the patched copy.
