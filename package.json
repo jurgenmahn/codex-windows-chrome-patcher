@@ -9,7 +9,7 @@
     "patch:apply": "node ./scripts/patch-codex-chrome-windows.mjs --apply --patch-exe-integrity"
   },
   "dependencies": {
-    "@electron/asar": "^3.2.18"
+    "@electron/asar": "^4.2.0"
   }
 }
 
