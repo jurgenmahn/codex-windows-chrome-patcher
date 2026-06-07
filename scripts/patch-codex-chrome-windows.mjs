@@ -19,9 +19,24 @@ const PACKAGE_SUFFIX = "_x64__2p2nqsd0c76g0";
 const ORIGINAL_ASAR_HEADER_HASH =
   "0914b5a1cd66a81962edb46e3f8ac49bc574144a4460ec55ff46010273eda9fd";
 
+// Electron bakes its fuse configuration into the main binary as a known
+// sentinel string followed by [wireVersion, fuseCount, ...stateBytes]. The
+// asar header hash only needs patching when EnableEmbeddedAsarIntegrityValidation
+// is ON; newer Codex builds ship it OFF (and embed no hash at all).
+const FUSE_SENTINEL = "dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+const FUSE_ASAR_INTEGRITY_INDEX = 4; // EnableEmbeddedAsarIntegrityValidation
+
 function findLatestCodexApp() {
   if (!existsSync(WINDOWS_APPS)) return null;
-  const candidates = readdirSync(WINDOWS_APPS)
+  let entries;
+  try {
+    entries = readdirSync(WINDOWS_APPS);
+  } catch {
+    // WindowsApps listing is often ACL-denied (EPERM). Auto-detect simply
+    // fails in that case; the caller can still pass --app explicitly.
+    return null;
+  }
+  const candidates = entries
     .filter((name) => name.startsWith("OpenAI.Codex_") && name.endsWith(PACKAGE_SUFFIX))
     .map((name) => join(WINDOWS_APPS, name))
     .filter((path) => existsSync(join(path, "app", "resources", "app.asar")))
@@ -95,6 +110,46 @@ function asarHeaderHash(asarPath) {
   return createHash("sha256").update(buffer.subarray(16, 16 + headerSize)).digest("hex");
 }
 
+function readAsarHeader(asarPath) {
+  const buffer = readFileSync(asarPath);
+  const headerSize = buffer.readUInt32LE(12);
+  return JSON.parse(buffer.toString("utf8", 16, 16 + headerSize));
+}
+
+function collectUnpackedFiles(node, parts, acc) {
+  if (node == null || typeof node !== "object") return acc;
+  if (node.files && typeof node.files === "object") {
+    for (const [name, child] of Object.entries(node.files)) {
+      collectUnpackedFiles(child, [...parts, name], acc);
+    }
+  } else if (node.unpacked === true && !("link" in node)) {
+    acc.push(parts.join("\\"));
+  }
+  return acc;
+}
+
+// asar's extractAll reads EVERY unpacked file (native .node bindings live in
+// <asar>.unpacked) and aborts with ENOENT if even one is missing. Newer Codex
+// builds ship a header that references optional natives (e.g. serialport) that
+// aren't on disk. Those are irrelevant to the Chrome-plugin patch, so drop a
+// zero-byte placeholder for each missing one so extract can proceed, and return
+// the paths so the caller can remove them afterward (leaving the install as it
+// was). The bundles we patch live INSIDE the asar, never in .unpacked.
+function healMissingUnpacked(asarPath) {
+  const unpackedRoot = `${asarPath}.unpacked`;
+  if (!existsSync(unpackedRoot)) return [];
+  const header = readAsarHeader(asarPath);
+  const created = [];
+  for (const rel of collectUnpackedFiles(header, [], [])) {
+    const onDisk = join(unpackedRoot, rel);
+    if (existsSync(onDisk)) continue;
+    mkdirSync(dirname(onDisk), { recursive: true });
+    writeFileSync(onDisk, Buffer.alloc(0));
+    created.push(onDisk);
+  }
+  return created;
+}
+
 // The expected app.asar header hash is embedded in Codex.exe. Depending on the
 // Electron/Windows build it can be stored as ASCII hex, UTF-16LE hex (PE
 // resources are wide), or the raw 32-byte SHA-256 digest. Encode each candidate
@@ -102,6 +157,32 @@ function asarHeaderHash(asarPath) {
 function encodeHash(hexHash, encoding) {
   if (encoding === "hex") return Buffer.from(hexHash, "hex"); // raw 32 bytes
   return Buffer.from(hexHash, encoding); // "utf8" | "utf16le"
+}
+
+// Read the EnableEmbeddedAsarIntegrityValidation fuse from whichever app binary
+// carries the Electron fuse wire (Codex.exe on older builds, chrome.dll on
+// newer ones). Returns { state: "on"|"off"|"removed"|"unknown", file }.
+function readAsarIntegrityFuse(appRoot) {
+  const sentinel = Buffer.from(FUSE_SENTINEL, "ascii");
+  const appDir = join(appRoot, "app");
+  const preferred = [join(appDir, "Codex.exe"), join(appDir, "chrome.dll")];
+  const rest = walkFiles(appDir, (_full, name) => /\.(exe|dll)$/i.test(name));
+  const seen = new Set();
+  for (const file of [...preferred, ...rest]) {
+    if (seen.has(file) || !existsSync(file)) continue;
+    seen.add(file);
+    const buf = readFileSync(file);
+    const at = buf.indexOf(sentinel);
+    if (at < 0) continue;
+    let p = at + sentinel.length;
+    const wireVersion = buf[p++];
+    const count = buf[p++];
+    if (FUSE_ASAR_INTEGRITY_INDEX >= count) return { state: "unknown", file };
+    const v = buf[p + FUSE_ASAR_INTEGRITY_INDEX];
+    const state = v === 0x31 ? "on" : v === 0x30 ? "off" : v === 0x72 ? "removed" : "unknown";
+    return { state, file, wireVersion, count };
+  }
+  return { state: "unknown", file: null };
 }
 
 function patchExeAsarIntegrity(appRoot, oldHash, newHash) {
@@ -350,7 +431,19 @@ function main() {
 
   if (existsSync(work)) rmSync(work, { recursive: true, force: true });
   mkdirSync(dirname(work), { recursive: true });
-  run(opts.node, [opts.asar, "extract", asarPath, work]);
+  const placeholders = healMissingUnpacked(asarPath);
+  if (placeholders.length > 0) {
+    console.warn(
+      `Note: ${placeholders.length} unpacked file(s) referenced by the asar header are missing on disk ` +
+        `(optional natives, unrelated to the Chrome plugin). Using empty placeholders to allow extraction:\n` +
+        placeholders.map((p) => `  - ${p}`).join("\n"),
+    );
+  }
+  try {
+    run(opts.node, [opts.asar, "extract", asarPath, work]);
+  } finally {
+    for (const placeholder of placeholders) rmSync(placeholder, { force: true });
+  }
 
   const results = patchTree(work);
   console.log(JSON.stringify({ mode: opts.apply ? "apply" : "dry-run", appRoot, work, results }, null, 2));
@@ -371,7 +464,20 @@ function main() {
   // newHash = header hash of the freshly packed/patched asar.
   let exePatch = null;
   if (opts.patchExeIntegrity) {
-    exePatch = patchExeAsarIntegrity(appRoot, asarHeaderHash(asarPath), asarHeaderHash(packed));
+    const fuse = readAsarIntegrityFuse(appRoot);
+    if (fuse.state === "off" || fuse.state === "removed") {
+      console.log(
+        `Embedded ASAR integrity validation is ${fuse.state} ` +
+          `(Electron fuse in ${fuse.file}); skipping exe integrity patch — not needed for this build.`,
+      );
+    } else {
+      if (fuse.state === "unknown") {
+        console.warn(
+          "Could not read the ASAR integrity fuse; attempting exe patch anyway.",
+        );
+      }
+      exePatch = patchExeAsarIntegrity(appRoot, asarHeaderHash(asarPath), asarHeaderHash(packed));
+    }
   }
 
   cpSync(asarPath, backup);
