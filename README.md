@@ -8,7 +8,7 @@ This repo documents the exact approach we used:
 
 1. Copy the installed Codex app out of `WindowsApps` into a writable folder.
 2. Patch `app.asar` in that loose copy so `externalBrowserUse` is enabled.
-3. Patch the Electron ASAR integrity hash inside the copied `Codex.exe`.
+3. Patch the Electron ASAR integrity hash inside the copied `Codex.exe` (only if that build enforces it).
 4. Launch the patched loose copy.
 5. Install or reconnect the official Codex Chrome Extension.
 
@@ -108,6 +108,25 @@ If the extension says disconnected:
 3. Open the extension popup once.
 4. Confirm the extension is installed in the Chrome profile you are using.
 
+## Known Limitations
+
+### The "external browser use" toggle in Settings shows OFF again after reopening
+
+This is cosmetic. The patch forces the feature **availability** (so Chrome can be
+used) and the runtime feature dispatch, but the Settings toggle reads its checked
+state from a separate persisted user setting that the patch does not override.
+When you close and reopen Settings, the toggle can therefore appear disabled.
+
+In practice the Chrome backend stays connected and controllable across this: the
+extension popup remains `Connected` and Codex can still drive Chrome. Forcing the
+displayed toggle to stay on would require patching the persisted-setting read path
+as well, which we deliberately left alone to keep the patch minimal and reversible.
+
+### Settings via the Chrome extension
+
+Clicking **Settings** from the Codex Chrome extension popup still opens the normal
+Codex settings screen as expected — the patch does not change that navigation.
+
 ## Restore / Rollback
 
 For a loose copy, rollback is simple:
@@ -130,8 +149,18 @@ The patch modifies:
 
 - The main Electron bundle feature defaults.
 - The main bundle plugin availability predicates.
+- The main bundle effective-state objects (so the forced value also flows to the UI).
 - The renderer feature dispatch value.
 - Optionally, the copied `Codex.exe` embedded ASAR header hash, so Electron accepts the repacked ASAR in a loose copy.
+
+The patcher is resilient to minified-bundle churn between Codex versions:
+
+- Bundle files are located by glob (`main-*.js`, `app-main-*.js`) instead of hardcoded content hashes, so a new build's renamed chunks are still found.
+- Markers are matched with regexes that tolerate renamed minified identifiers and operand-order changes, rather than exact string literals.
+- The plugin-availability rule neutralizes any `isAvailable` predicate gated on `externalBrowserUseAllowed`, regardless of how many plugins use it or how their arguments are destructured.
+- The `Codex.exe` ASAR integrity hash is derived from the pristine `app.asar` (the backup) rather than a hardcoded constant, and is searched/replaced in multiple encodings (UTF-16LE, UTF-8, raw digest). If no embedded integrity hash is present, that step is simply skipped — some Codex builds do not enforce an embedded `app.asar` hash, in which case `--patch-exe-integrity` is unnecessary.
+- The exe-integrity step runs **before** `app.asar` is overwritten, so a failure there leaves the loose copy untouched instead of half-patched.
+- Each rule is idempotent: it recognizes its already-patched form, so `--apply` can be run again on an already-patched `app.asar` (e.g. after a Codex update) without a prior `--restore`.
 
 ## Troubleshooting
 
