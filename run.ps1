@@ -39,6 +39,20 @@ function Write-Step([string]$msg) { Write-Host "`n==> $msg" -ForegroundColor Cya
 function Write-Ok([string]$msg)   { Write-Host "    $msg" -ForegroundColor Green }
 function Fail([string]$msg)       { Write-Host "`nERROR: $msg" -ForegroundColor Red; exit 1 }
 
+# Long-path-safe recursive delete. Remove-Item -Recurse chokes on the deep
+# node_modules paths (> 260 chars) inside extracted asar trees in PS 5.1;
+# mirroring an empty dir over the target with robocopy empties it safely, then
+# the now-empty root deletes cleanly.
+function Remove-Tree([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return }
+  $empty = Join-Path $env:TEMP "codex-empty-mirror"
+  New-Item -ItemType Directory -Path $empty -Force | Out-Null
+  & robocopy "$empty" "$path" /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+  Remove-Item -LiteralPath $path  -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+  $global:LASTEXITCODE = 0
+}
+
 # --- 1. Node.js present and recent enough --------------------------------------
 Write-Step "Checking Node.js"
 $node = Get-Command node -ErrorAction SilentlyContinue
@@ -104,13 +118,14 @@ Write-Ok "Done"
 # --- 5. Rebuild the patched copy at the fixed location -------------------------
 Write-Step "Copying Codex to $Target"
 if (Test-Path -LiteralPath $Target) {
-  # Retry removal a couple of times in case of lingering file locks.
-  for ($i = 0; $i -lt 3 -and (Test-Path -LiteralPath $Target); $i++) {
-    try { Remove-Item -LiteralPath $Target -Recurse -Force -ErrorAction Stop }
-    catch { Start-Sleep -Seconds 1 }
-  }
+  # Kill anything still running from the target (helpers can outlive Codex.exe).
+  Get-CimInstance Win32_Process |
+    Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like "$Target*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Milliseconds 300
+  Remove-Tree $Target
   if (Test-Path -LiteralPath $Target) {
-    Fail "Could not remove existing $Target (a file may still be locked). Close Codex and re-run."
+    Fail "Could not remove existing $Target. Close Codex (and any patched Codex helpers) and re-run."
   }
 }
 # robocopy handles the deep node_modules paths that trip Copy-Item's MAX_PATH.
@@ -132,6 +147,16 @@ if ($LASTEXITCODE -ne 0) {
   Fail "Patcher failed (exit $LASTEXITCODE). The Codex bundle may have changed; check scripts/patch-codex-chrome-windows.mjs."
 }
 Write-Ok "Patched"
+
+# --- 6b. Sweep temporary patcher artifacts -------------------------------------
+# The patcher cleans its own work dir/temp asar on success; this also clears any
+# leftovers from older runs (before that cleanup existed).
+Write-Step "Cleaning up temporary files"
+Get-ChildItem -Path "C:\tmp" -Filter "codex-chrome-patch-*" -Directory -ErrorAction SilentlyContinue |
+  ForEach-Object { Remove-Tree $_.FullName }
+Get-ChildItem -Path "C:\tmp" -Filter "codex-chrome-patched-*.asar" -File -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+Write-Ok "Done"
 
 # --- 7. Create / refresh the Desktop shortcut ----------------------------------
 $codexExe = Join-Path $Target "app\Codex.exe"

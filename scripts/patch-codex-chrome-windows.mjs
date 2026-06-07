@@ -483,8 +483,14 @@ function main() {
   cpSync(asarPath, backup);
   cpSync(packed, asarPath);
 
+  // The extraction work dir and temp packed asar are only needed up to this
+  // copy; remove them so repeated --apply runs don't litter C:\tmp. The backup
+  // next to app.asar is kept. (Dry-run returns earlier and leaves work in place
+  // for inspection.)
+  rmSync(work, { recursive: true, force: true });
+  rmSync(packed, { force: true });
+
   console.log(`Applied patch. Backup: ${backup}`);
-  console.log(`Temporary patched ASAR: ${packed}`);
   if (exePatch != null) {
     console.log(`Patched Electron ASAR integrity in ${exePatch.exePath} (${exePatch.encoding}): ${exePatch.oldHash} -> ${exePatch.newHash}`);
   }
